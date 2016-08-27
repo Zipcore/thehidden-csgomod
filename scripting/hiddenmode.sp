@@ -1,5 +1,6 @@
 #include <sourcemod>
 #include <sdkhooks>
+#include <sdktools>
 #include <cstrike>
 #include <hiddenmode>
 
@@ -12,23 +13,30 @@ new Handle:pCvar_iTimeCountdown;
 new Handle:pCvar_bFallDamage;
 new Handle:pCvar_iHiddenHP;
 new Handle:pCvar_bShowHiddenHP;
+new Handle:pCvar_fHiddenSpeedMul;
+new Handle:pCvar_fHiddenGravityMul;
+new Handle:pCvar_fJumpPower;
+new Handle:pCvar_fSkillCountdown;
+new Handle:pCvar_bShowHiddenBlood;
+new Handle:pCvar_bPainShock;
+
 
 // Timer Handle
 new Handle:Timer_Countdown;
 new Handle:Timer_ShowHiddenHP;
+new Handle:Timer_SkillCountdown;
 
 // Global variables
 new bool:bRoundStart = false;
 new bool:bGameBegin = false;
 new bool:bRoundEnd = false;
+
 new gMaxPlayers;
 new gHiddenIndex;
 new gTimer;
+new Float:gSkillCountdown;
 new PlayerClass:gPlayerClass[MAXPLAYERS + 1];
-new gPlayerTeam[MAXPLAYERS + 1];
-new gRoundCount;
-new gHumanWinRound;
-new gHiddenWinRound;
+
 
 public Plugin myinfo = {
 	name        = "",
@@ -52,13 +60,20 @@ public void OnPluginStart() {
 	HookEvent("round_start", OnRoundStart);
 	HookEvent("round_end", OnRoundEnd);
 	
-	pCvar_iTimeCountdown = CreateConVar("hm_cdtime", "10");
-	pCvar_bFallDamage = CreateConVar("hm_falldamage", "0");
-	pCvar_iHiddenHP = CreateConVar("hm_hiddenhp", "5000");
-	pCvar_bShowHiddenHP = CreateConVar("hm_showhiddenhp", "1");
+	AddCommandListener(OnLookWeaponPressed, "+lookatweapon");
+	
+	pCvar_iTimeCountdown 	= CreateConVar("hm_cdtime", "10");
+	pCvar_bFallDamage 		= CreateConVar("hm_falldamage", "0");
+	pCvar_iHiddenHP 		= CreateConVar("hm_hiddenhp", "5000");
+	pCvar_bShowHiddenHP 	= CreateConVar("hm_showhiddenhp", "1");
+	pCvar_fHiddenSpeedMul 	= CreateConVar("hm_hiddenspeedmul", "2.0");
+	pCvar_fHiddenGravityMul = CreateConVar("hm_hiddengravitymul", "0.5");
+	pCvar_fJumpPower 		= CreateConVar("hm_jumppower", "1000.0");
+	pCvar_fSkillCountdown 	= CreateConVar("hm_skillcd", "5.0");
+	pCvar_bShowHiddenBlood 	= CreateConVar("hm_showhiddenblood", "1");
+	// Notice: Require turn on Show Hidden Blood to turn off Pain Shock
+	pCvar_bPainShock		= CreateConVar("hm_hiddenpainshock", "0");
 }
-
-
 
 public Func_IsPlayerHidden(Handle plugin, int numParams) {
 	int iClient = GetNativeCell(1);
@@ -78,8 +93,9 @@ public Func_SetPlayerClass(Handle plugin, int numParams) {
 }
 
 public OnClientPutInServer(client) {
-	SDKHook(client, SDKHook_TraceAttack, TraceAttack); 
+	SDKHook(client, SDKHook_TraceAttack, OnTraceAttack); 
 	SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage);
+	
 	gPlayerClass[client] = TEAM_HUMAN;
 }
 
@@ -97,33 +113,59 @@ public OnRoundEnd(Handle:event, const String:name[], bool:dontBroadcast) {
 	bGameBegin = false;
 	bRoundEnd = true;
 	
-	// Reset Hidden ID
+	// Unhook transmit to make player visible again
+	SDKUnhook(gHiddenIndex, SDKHook_SetTransmit, Hook_SetTransmit);  
+	
+	// Reset player gravity
+	SetEntityGravity(gHiddenIndex, 1.0);
+	
+	// Disable wall seeing
+	MakeHumanGlow(false);
+	
+	// Reset everything is done. Finally reset The Hidden's index
 	gHiddenIndex = 0;
 	
 	FuncBalanceTeam();
 }
 
-public Action:TimerCountdown(Handle:timer) {
-	if (gTimer <= 0) {
-		gMaxPlayers = FuncCountPlayerConnected();
-		gHiddenIndex = FuncGetRandomPlayerAlive(GetRandomInt(1, gMaxPlayers));
-		
-		new String:hiddenName[64];
-		GetClientName(gHiddenIndex, hiddenName, charsmax(hiddenName));
-		PrintHintTextToAll("%s has become The Hidden", hiddenName);
-		PrintToChatAll("%s has become The Hidden", hiddenName);
-		bGameBegin = true;
-		
-		StartHiddenMode();
-		
-		KillTimer(Timer_Countdown);
-		return Plugin_Stop;
+public Action:OnLookWeaponPressed(client, const String:command[], argc) {
+	
+	if (gHiddenIndex == 0 || client != gHiddenIndex) return Plugin_Continue;
+	
+	if (gSkillCountdown == 0.0) {
+		DoSkill(client);
+		gSkillCountdown = GetConVarFloat(pCvar_fSkillCountdown);
+		Timer_SkillCountdown = CreateTimer(1.0, OnSkillCountdown, _, TIMER_REPEAT);
 	}
 	
-	PrintHintTextToAll("The Hidden will be selected after %d second(s)", gTimer);
-	PrintToChatAll("The Hidden will be selected after %d second(s)", gTimer);
-	gTimer--;
-	return Plugin_Continue;
+	return Plugin_Handled;
+}
+
+public Action:OnTraceAttack(victim, &attacker, &inflictor, &Float:damage, &damageType, &ammoType, hitBox, hitGroup) {
+	// Ignore all damage send to player if game is not begin
+	if (!bRoundStart || !bGameBegin || bRoundEnd) return Plugin_Handled;
+	
+	// Game begin
+	if (bRoundStart && bGameBegin) {
+		if (attacker == 0) return Plugin_Continue;
+		
+		if (victim == gHiddenIndex && attacker > 0 && attacker <= MaxClients) {
+			if(!GetConVarBool(pCvar_bShowHiddenBlood)) {
+				int health = GetEntProp(victim, Prop_Send, "m_iHealth");
+				health -= RoundFloat(damage);
+				SetEntProp(victim, Prop_Data, "m_iHealth", health);
+				
+				return Plugin_Handled;
+			}
+			else return Plugin_Continue;
+		}
+		
+		if (attacker == gHiddenIndex && victim > 0 && victim <= MaxClients)
+			return Plugin_Continue;
+		
+		if (attacker < 0 || attacker > MaxClients) return Plugin_Handled;
+	}
+	return Plugin_Handled;
 }
 
 public Action:OnTakeDamage(victim, &attacker, &inflictor, &Float:damage, &damagetype) {
@@ -132,35 +174,36 @@ public Action:OnTakeDamage(victim, &attacker, &inflictor, &Float:damage, &damage
 	
 	// Game begin
 	if (bRoundStart && bGameBegin) {
-		if (victim > 0 && victim <= MaxClients) {
-			if(attacker <=0 || attacker > MaxClients)
-				return Plugin_Handled;
-			else
-				return Plugin_Continue;
-				
+		if (attacker == 0) return Plugin_Continue;
+		
+		if (victim == gHiddenIndex && attacker > 0 && attacker <= MaxClients) {
+			if (GetConVarBool(pCvar_bShowHiddenBlood)) {
+				if (!GetConVarBool(pCvar_bPainShock)) {
+					int health = GetEntProp(victim, Prop_Send, "m_iHealth");
+					health -= RoundFloat(damage);
+					SetEntProp(victim, Prop_Data, "m_iHealth", health);
+					
+					return Plugin_Handled;
+				}
+				else return Plugin_Continue;
+			}
 		}
+		
+		if (attacker == gHiddenIndex && victim > 0 && victim <= MaxClients)
+			return Plugin_Continue;
+		
+		if (attacker < 0 || attacker > MaxClients) return Plugin_Handled;
 	}
-	
 	return Plugin_Handled;
 }
 
-public Action:TraceAttack(victim, &attacker, &inflictor, &Float:damage, &damageType, &ammoType, hitBox, hitGroup) {
-	// Ignore all damage send to player if game is not begin
-	if (!bRoundStart || !bGameBegin || bRoundEnd) return Plugin_Handled;
-	
-	// Game begin
-	if (bRoundStart && bGameBegin) {
-		if (victim > 0 && victim <= MaxClients) {
-			if(attacker <=0 || attacker > MaxClients)
-				return Plugin_Handled;
-			else
-				return Plugin_Continue;
-				
-		}
-	}
-	
-	return Plugin_Handled;
-}
+public Action:Hook_SetTransmit(entity, client) 
+{ 
+    if (entity != client) 
+        return Plugin_Handled;
+     
+    return Plugin_Continue; 
+}  
 
 public StartHiddenMode() {
 	// First, set class Human or Hidden for all of players
@@ -168,46 +211,119 @@ public StartHiddenMode() {
 	
 	// Change players team by class
 	FuncChangeAllHumanToCT();
+	
+	// Finally, create The Hidden
 	FuncMakeHidden();
 	
 }
 
-FuncMakeHidden() {
-	// Change The Hidden to T
-	FuncChangeHiddenToT();
+/** Timer function **/
+public Action:TimerCountdown(Handle:timer) {
+	if (gTimer <= 0) {
+		gMaxPlayers = FuncCountPlayerConnected();
+		gHiddenIndex = FuncGetRandomPlayerAlive(GetRandomInt(1, gMaxPlayers));
+		
+		bGameBegin = true;
+		
+		StartHiddenMode();
+		//KillTimer(Timer_Countdown);
+		return Plugin_Stop;
+	}
 	
-	// Set HP to The Hidden
-	SetEntityHealth(gHiddenIndex, GetConVarInt(pCvar_iHiddenHP));
+	if(gTimer == 1)
+		PrintHintTextToAll("The Hidden will be selected after 1 second");
+	else
+		PrintHintTextToAll("The Hidden will be selected after %d seconds", gTimer);
+		
+	gTimer--;
 	
-	// Strip all weapon
-	Client_RemoveAllWeapons(gHiddenIndex, 
-	
-	// Toggle show The Hidden's HP to all players
-	if (GetConVarBool(pCvar_bShowHiddenHP))
-		Timer_ShowHiddenHP = CreateTimer(0.1, ShowHiddenHP, _, TIMER_REPEAT);
+	return Plugin_Continue;
 }
 
+public Action:OnSkillCountdown(Handle:timer) {
+	if (gSkillCountdown <= 0.0) {
+		//KillTimer(Timer_SkillCountdown);
+		return Plugin_Stop;
+	}
+	
+	gSkillCountdown--;
+	
+	return Plugin_Continue;
+}
 
 public Action:ShowHiddenHP(Handle:timer) {
 	if (!bRoundStart || bRoundEnd || gHiddenIndex == 0) {
-		KillTimer(Timer_ShowHiddenHP);
+		//KillTimer(Timer_ShowHiddenHP)
 		return Plugin_Stop;
 	}
 	
 	if(bGameBegin) {
-		PrintHintTextToAll("Hidden's HP: %d", GetClientHealth(gHiddenIndex));
+		static String:name[64];
+		GetClientName(gHiddenIndex, name, charsmax(name));
+		if (gSkillCountdown != 0.0)
+			PrintHintTextToAll("Hidden: %s\nHP: %d\nSkill: <font color='#ff0000'>Boost</font> (Press F) %d", name, GetClientHealth(gHiddenIndex), RoundFloat(gSkillCountdown));
+		else
+			PrintHintTextToAll("Hidden: %s\nHP: %d\nSkill: Boost (Press F)", name, GetClientHealth(gHiddenIndex));
 	}
 	
 	return Plugin_Continue;
 }
 
+/**** Private function ****/
+FuncMakeHidden() {
+	// Change The Hidden to T
+	FuncChangeHiddenToT();
+	
+	// Set abilities to The Hidden: HP, Speed, Gravity,....
+	SetEntityHealth(gHiddenIndex, GetConVarInt(pCvar_iHiddenHP));
+	
+	new Float:speedMul = GetConVarFloat(pCvar_fHiddenSpeedMul);
+	SetEntPropFloat(gHiddenIndex, Prop_Send, "m_flLaggedMovementValue", speedMul);
+	
+	new Float:gravityMul = GetConVarFloat(pCvar_fHiddenGravityMul);
+	SetEntityGravity(gHiddenIndex, gravityMul);
+	
+	// Make The Hidden invisible by using hook
+	SDKHook(gHiddenIndex, SDKHook_SetTransmit, Hook_SetTransmit); 
+	
+	// The Hidden can see through wall
+	MakeHumanGlow(true);
+	
+	if (GetConVarBool(pCvar_bShowHiddenHP))
+		Timer_ShowHiddenHP = CreateTimer(0.1, ShowHiddenHP, _, TIMER_REPEAT);
+	
+	// Strip all weapon except knife
+	new knife = GetPlayerWeaponSlot(gHiddenIndex, 2);
+	if (IsValidEntity(knife)) {
+		new String:knife_name[32];
+		GetEntityClassname(knife, knife_name, 32);
+		Client_RemoveAllWeapons(gHiddenIndex, knife_name, true);
+	}
+}
+
+DoSkill(int iClient) {
+	// Get current player's velocity
+	float fEyeAngles[3], fDirection[3];
+	GetClientEyeAngles(iClient, fEyeAngles);
+	GetAngleVectors(fEyeAngles, fDirection, NULL_VECTOR, NULL_VECTOR);
+	
+	float fPower = GetConVarFloat(pCvar_fJumpPower);
+	ScaleVector(fDirection, fPower);
+	
+	TeleportEntity(iClient, NULL_VECTOR , NULL_VECTOR, fDirection);  
+}
+
+MakeHumanGlow(bool bForever) {
+	SetEntPropFloat(gHiddenIndex, Prop_Send, "m_flDetectedByEnemySensorTime", bForever ? (GetGameTime() + 9999.0) : 0.0);
+}
+
 FuncChangePlayerTeam(int iClient, newTeam) {
-	// If change to CS_TEAM_NONE. Stop change team
+	// Stop if change to CS_TEAM_NONE
 	if (newTeam == CS_TEAM_NONE) return;
 	
 	new curTeam = GetClientTeam(iClient);
 	
-	// If new team is the current team. Stop change team
+	// Stop f new team is the current team
 	if (curTeam == newTeam) return;
 	
 	// Change team
@@ -234,7 +350,7 @@ FuncChangeAllHumanToCT() {
 }
 
 FuncChangeHiddenToT() {
-	// If no The Hidden selected. Stop change team
+	// Stop if no The Hidden selected
 	if (gHiddenIndex == 0) return;
 	
 	// Check chosen player is set to The Hidden or not
@@ -350,6 +466,93 @@ FuncCountTsAlive() {
 	return iTs;
 }
 
+/***************************************************
+	* Some of these stocks were extracted from  *
+	* SMLib and were changed a bit in order to 	*
+	* suitable for this plugin.					* 
+	* 	    ___  _____  ____   ____         	*
+	* 	   |       |   |    | |      |  /   	*
+	* 	   |__     |   |    | |      |/     	*
+	* 	      |    |   |    | |      |\     	*
+	* 	   ___|    |   |____| |____  |  \  		*
+	* 											*
+ ***************************************************/ 
+ 
+ /**
+ * Gets the Classname of an entity.
+ * This is like GetEdictClassname(), except it works for ALL
+ * entities, not just edicts.
+ *
+ * @param entity			Entity index.
+ * @param buffer			Return/Output buffer.
+ * @param size				Max size of buffer.
+ * @return					
+ */
+stock Entity_GetClassName(entity, String:buffer[], size)
+{
+	GetEntPropString(entity, Prop_Data, "m_iClassname", buffer, size);
+	
+	if (buffer[0] == '\0') {
+		return false;
+	}
+	
+	return true;
+}
+
+/**
+ * Checks if an entity is a player or not.
+ * No checks are done if the entity is actually valid,
+ * the player is connected or ingame.
+ *
+ * @param entity			Entity index.
+ * @return 				True if the entity is a player, false otherwise.
+ */
+stock bool:Entity_IsPlayer(entity)
+{
+	if (entity < 1 || entity > MaxClients) {
+		return false;
+	}
+	
+	return true;
+}
+
+/**
+ * Checks if an entity matches a specific entity class.
+ *
+ * @param entity		Entity Index.
+ * @param class			Classname String.
+ * @return				True if the classname matches, false otherwise.
+ */
+stock bool:Entity_ClassNameMatches(entity, const String:className[], partialMatch=false)
+{
+	decl String:entity_className[64];
+	Entity_GetClassName(entity, entity_className, sizeof(entity_className));
+
+	if (partialMatch) {
+		return (StrContains(entity_className, className) != -1);
+	}
+	
+	return StrEqual(entity_className, className);
+}
+
+/**
+ * Kills an entity on the next frame (delayed).
+ * It is safe to use with entity loops.
+ * If the entity is is player ForcePlayerSuicide() is called.
+ *
+ * @param kenny			Entity index.
+ * @return 				True on success, false otherwise
+ */
+stock bool:Entity_Kill(entity)
+{
+	if (Entity_IsPlayer(entity)) {
+		ForcePlayerSuicide(entity);
+		return true;
+	}
+	
+	return AcceptEntityInput(entity, "kill");
+}
+
 /**
  * Gets the offset for a client's weapon list (m_hMyWeapons).
  * The offset will saved globally for optimization.
@@ -362,48 +565,10 @@ stock Client_GetWeaponsOffset(client)
 	static offset = -1;
 
 	if (offset == -1) {
-		offset = FindDataMapOffs(client, "m_hMyWeapons");
+		offset = FindDataMapInfo(client, "m_hMyWeapons");
 	}
 	
 	return offset;
-}
-
-/**
- * Changes the active/current weapon of a player by Index.
- * Note: No changing animation will be played !
- *
- * @param client		Client Index.
- * @param weapon		Index of a valid weapon.
- * @noreturn
- */
-stock Client_SetActiveWeapon(client, weapon)
-{
-	SetEntPropEnt(client, Prop_Data, "m_hActiveWeapon", weapon);
-	ChangeEdictState(client, FindDataMapOffs(client, "m_hActiveWeapon"));
-}
-
-/**
- * Sets the primary and secondary ammo the player carries for a specific weapon index.
- *
- * @param client		Client Index.
- * @param weapon		Weapon Entity Index.
- * @param primaryAmmo	Primary ammo stock value from the client, if -1 the value is untouched.
- * @param secondaryAmmo	Secondary ammo stock value from the client, if -1 the value is untouched.
- * @noreturn		
- */
-stock Client_SetWeaponPlayerAmmoEx(client, weapon, primaryAmmo=-1, secondaryAmmo=-1)
-{
-	new offset_ammo = FindDataMapOffs(client, "m_iAmmo");
-
-	if (primaryAmmo != -1) {
-		new offset = offset_ammo + (Weapon_GetPrimaryAmmoType(weapon) * 4);
-		SetEntData(client, offset, primaryAmmo, 4, true);
-	}
-
-	if (secondaryAmmo != -1) {
-		new offset = offset_ammo + (Weapon_GetSecondaryAmmoType(weapon) * 4);
-		SetEntData(client, offset, secondaryAmmo, 4, true);
-	}
 }
 
 /**
@@ -421,22 +586,29 @@ stock Client_RemoveAllWeapons(client, const String:exclude[]="", bool:clearAmmo=
 	new offset = Client_GetWeaponsOffset(client) - 4;
 	
 	new numWeaponsRemoved = 0;
-	for (new i=0; i < MAX_WEAPONS; i++) {
+	for (new i=0; i < 48; i++) {
 		offset += 4;
 
 		new weapon = GetEntDataEnt2(client, offset);
 		
-		if (!Weapon_IsValid(weapon)) {
+		if (!IsValidEdict(weapon)) {
 			continue;
 		}
 		
 		if (exclude[0] != '\0' && Entity_ClassNameMatches(weapon, exclude)) {
-			Client_SetActiveWeapon(client, weapon);
+			SetEntPropEnt(client, Prop_Data, "m_hActiveWeapon", weapon);
+			ChangeEdictState(client, FindDataMapInfo(client, "m_hActiveWeapon"));
 			continue;
 		}
 		
 		if (clearAmmo) {
-			Client_SetWeaponPlayerAmmoEx(client, weapon, 0, 0);
+			new offset_ammo = FindDataMapInfo(client, "m_iAmmo");
+			
+			new priOffset = offset_ammo + (GetEntProp(weapon, Prop_Data, "m_iPrimaryAmmoType") * 4);
+			SetEntData(client, priOffset, 0, 4, true);
+			
+			new secondOffset = offset_ammo + (GetEntProp(weapon, Prop_Data, "m_iSecondaryAmmoType") * 4);
+			SetEntData(client, secondOffset, 0, 4, true);
 		}
 
 		if (RemovePlayerItem(client, weapon)) {
